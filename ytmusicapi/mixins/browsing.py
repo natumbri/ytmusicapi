@@ -5,18 +5,21 @@ from urllib.parse import parse_qs
 from typing import List, Dict
 from ytmusicapi.helpers import *
 from ytmusicapi.parsers.playlists import *
+# from mopidy_youtube import logger
 
 
 class BrowsingMixin:
-    def search(self, query: str, filter: str = None) -> List[Dict]:
+    def search(self, query: str, filter: str = None, maxResults: int = 20) -> List[Dict]:
         """
         Search YouTube music
-        Returns up to 20 results within the provided category.
+        Returns results within the provided category.
 
         :param query: Query string, i.e. 'Oasis Wonderwall'
         :param filter: Filter for item types. Allowed values:
           'songs', 'videos', 'albums', 'artists', 'playlists', 'uploads'.
           Default: Default search, including all types of items.
+        :param maxResults: Maximum number of results to return
+          Default: 20
         :return: List of results depending on filter.
           resultType specifies the type of item (important for default search).
           albums, artists and playlists additionally contain a browseId, corresponding to
@@ -44,72 +47,121 @@ class BrowsingMixin:
               }
             ]
         """
-        body = {'query': query}
-        endpoint = 'search'
         search_results = []
-        filters = ['albums', 'artists', 'playlists', 'songs', 'videos', 'uploads']
+        continuationToken = None
+        try:
+            while len(search_results) < maxResults:
+                result = self._base_search(q=query,
+                                           filter=filter,
+                                           continuationToken=continuationToken)
+                # logger.info("called _base_search")
+                search_results.extend(result["search_results"])
+                continuationToken = result["nextPageToken"]
+                if continuationToken is None:
+                    break
+        except Exception as e:
+            print(str(e))
+            # logger.info(e)
+
+        # logger.info(len(search_results))
+        return search_results[:maxResults]
+
+    def _base_search(self,
+                     q: str,
+                     filter: str = None,
+                     continuationToken: str = None) -> List[Dict]:
+        endpoint = "search"
+        search_results = []
+        body = {}
+        query = {}
+
+        filters = ["albums", "artists", "playlists", "songs", "videos", "uploads"]
         if filter and filter not in filters:
             raise Exception(
                 "Invalid filter provided. Please use one of the following filters or leave out the parameter: "
-                + ', '.join(filters))
+                + ", ".join(filters))
 
         if filter:
-            param1 = 'Eg-KAQwIA'
-            param3 = 'MABqChAEEAMQCRAFEAo%3D'
+            param1 = "Eg-KAQwIA"
+            param3 = "MABqChAEEAMQCRAFEAo%3D"
 
-            if filter == 'uploads':
-                params = 'agIYAw%3D%3D'
+            if filter == "uploads":
+                params = "agIYAw%3D%3D"
             else:
-                if filter == 'videos':
-                    param2 = 'BABGAAgACgA'
-                elif filter == 'albums':
-                    param2 = 'BAAGAEgACgA'
-                elif filter == 'artists':
-                    param2 = 'BAAGAAgASgA'
-                elif filter == 'playlists':
-                    param2 = 'BAAGAAgACgB'
-                elif filter == 'uploads':
+                if filter == "videos":
+                    param2 = "BABGAAgACgA"
+                elif filter == "albums":
+                    param2 = "BAAGAEgACgA"
+                elif filter == "artists":
+                    param2 = "BAAGAAgASgA"
+                elif filter == "playlists":
+                    param2 = "BAAGAAgACgB"
+                elif filter == "uploads":
                     self.__check_auth()
-                    param2 = 'RABGAEgASgB'
+                    param2 = "RABGAEgASgB"
                 else:
-                    param2 = 'RAAGAAgACgA'
+                    param2 = "RAAGAAgACgA"
                 params = param1 + param2 + param3
 
-            body['params'] = params
+        type = filter[:-1] if filter else None
 
-        response = self._send_request(endpoint, body)
+        if not continuationToken:
+            body = {"query": q, "params": params}
+
+        if continuationToken:
+            query = {"cToken": continuationToken, "continuation": continuationToken}
+
+        response = self._send_request(endpoint, body, query=query)
 
         try:
-            # no results
-            if 'contents' not in response:
-                return search_results
 
-            if 'tabbedSearchResultsRenderer' in response['contents']:
-                results = response['contents']['tabbedSearchResultsRenderer']['tabs'][int(
-                    filter == "uploads")]['tabRenderer']['content']
+            results = None
+
+            if "continuationContents" in response:
+                results = response["continuationContents"]
+            elif "contents" in response:
+                if "tabbedSearchResultsRenderer" in response["contents"]:
+                    # with open("/tmp/tabbedSearchResultsRenderer.json", "w") as fp:
+                    #     json.dump(response, fp)
+                    # logger.info("tabbedSearchResultsRenderer")
+                    results = response["contents"]["tabbedSearchResultsRenderer"]["tabs"][int(
+                        filter ==  # noqa: W504
+                        "uploads")]["tabRenderer"]["content"]["sectionListRenderer"]["contents"]
+                else:
+                    results = response["contents"]["sectionListRenderer"]["contents"]
+
+            if not results:
+                return
+
+            items = []
+            nextToken = None
+            if "musicShelfContinuation" in results:
+                musicShelf = results["musicShelfContinuation"]
+                items.append(musicShelf["contents"])
+                if "continuations" in musicShelf:
+                    nextToken = musicShelf["continuations"][0]["nextContinuationData"][
+                        "continuation"]
             else:
-                results = response['contents']
+                for content in results:
+                    musicShelf = content["musicShelfRenderer"]
+                    items.append(musicShelf["contents"])
+                    if musicShelf["continuations"]:
+                        nextToken = musicShelf["continuations"][0]["nextContinuationData"][
+                            "continuation"]
 
-            results = nav(results, SECTION_LIST)
+            normalized_items = [
+                x["musicResponsiveListItemRenderer"] for thing in items for x in thing
+            ]
 
-            # no results
-            if len(results) == 1 and 'itemSectionRenderer' in results:
-                return search_results
-
-            for res in results:
-                if 'musicShelfRenderer' in res:
-                    results = res['musicShelfRenderer']['contents']
-
-                    for result in results:
-                        data = result['musicResponsiveListItemRenderer']
-                        type = filter[:-1] if filter else None
-                        search_result = self.parser.parse_search_result(data, type)
-                        search_results.append(search_result)
+            search_results = [
+                self.parser.parse_search_result(data, type) for data in normalized_items
+            ]
 
         except Exception as e:
             print(str(e))
+            # logger.info(str(e))
 
-        return search_results
+        return {"nextPageToken": nextToken, "search_results": search_results}
 
     def get_artist(self, channelId: str) -> Dict:
         """
@@ -183,32 +235,32 @@ class BrowsingMixin:
             }
         """
         body = prepare_browse_endpoint("ARTIST", channelId)
-        endpoint = 'browse'
+        endpoint = "browse"
         response = self._send_request(endpoint, body)
         results = nav(response, SINGLE_COLUMN_TAB + SECTION_LIST)
 
-        artist = {'description': None, 'views': None}
-        header = response['header']['musicImmersiveHeaderRenderer']
-        artist['name'] = nav(header, TITLE_TEXT)
+        artist = {"description": None, "views": None}
+        header = response["header"]["musicImmersiveHeaderRenderer"]
+        artist["name"] = nav(header, TITLE_TEXT)
         descriptionShelf = find_object_by_key(results,
-                                              'musicDescriptionShelfRenderer',
+                                              "musicDescriptionShelfRenderer",
                                               is_key=True)
         if descriptionShelf:
-            artist['description'] = descriptionShelf['description']['runs'][0]['text']
-            artist['views'] = None if 'subheader' not in descriptionShelf else descriptionShelf[
-                'subheader']['runs'][0]['text']
-        subscription_button = header['subscriptionButton']['subscribeButtonRenderer']
-        artist['channelId'] = subscription_button['channelId']
-        artist['subscribers'] = nav(subscription_button,
-                                    ['subscriberCountText', 'runs', 0, 'text'], True)
-        artist['subscribed'] = subscription_button['subscribed']
-        artist['thumbnails'] = nav(header, THUMBNAILS, True)
-        artist['songs'] = {'browseId': None}
-        if 'musicShelfRenderer' in results[0]:  # API sometimes does not return songs
+            artist["description"] = descriptionShelf["description"]["runs"][0]["text"]
+            artist["views"] = (None if "subheader" not in descriptionShelf else
+                               descriptionShelf["subheader"]["runs"][0]["text"])
+        subscription_button = header["subscriptionButton"]["subscribeButtonRenderer"]
+        artist["channelId"] = subscription_button["channelId"]
+        artist["subscribers"] = nav(subscription_button,
+                                    ["subscriberCountText", "runs", 0, "text"], True)
+        artist["subscribed"] = subscription_button["subscribed"]
+        artist["thumbnails"] = nav(header, THUMBNAILS, True)
+        artist["songs"] = {"browseId": None}
+        if "musicShelfRenderer" in results[0]:  # API sometimes does not return songs
             musicShelf = nav(results, MUSIC_SHELF)
-            if 'navigationEndpoint' in nav(musicShelf, TITLE):
-                artist['songs']['browseId'] = nav(musicShelf, TITLE + NAVIGATION_BROWSE_ID)
-            artist['songs']['results'] = parse_playlist_items(musicShelf['contents'])
+            if "navigationEndpoint" in nav(musicShelf, TITLE):
+                artist["songs"]["browseId"] = nav(musicShelf, TITLE + NAVIGATION_BROWSE_ID)
+            artist["songs"]["results"] = parse_playlist_items(musicShelf["contents"])
 
         artist.update(self.parser.parse_artist_contents(results))
         return artist
@@ -233,18 +285,18 @@ class BrowsingMixin:
             }
         """
         body = {"browseId": channelId, "params": params}
-        endpoint = 'browse'
+        endpoint = "browse"
         response = self._send_request(endpoint, body)
-        artist = nav(response['header']['musicHeaderRenderer'], TITLE_TEXT)
+        artist = nav(response["header"]["musicHeaderRenderer"], TITLE_TEXT)
         results = nav(response, SINGLE_COLUMN_TAB + SECTION_LIST + MUSIC_SHELF)
         albums = []
         release_type = nav(results, TITLE_TEXT).lower()
-        for result in results['contents']:
-            data = result['musicResponsiveListItemRenderer']
+        for result in results["contents"]:
+            data = result["musicResponsiveListItemRenderer"]
             browseId = nav(data, NAVIGATION_BROWSE_ID)
             title = get_item_text(data, 0)
             thumbnails = nav(data, THUMBNAILS)
-            album_type = get_item_text(data, 1) if release_type == "albums" else "Single"
+            album_type = (get_item_text(data, 1) if release_type == "albums" else "Single")
             year = get_item_text(data, 1, 2 if release_type == "albums" else 0, True)
             albums.append({
                 "browseId": browseId,
@@ -252,7 +304,7 @@ class BrowsingMixin:
                 "title": title,
                 "thumbnails": thumbnails,
                 "type": album_type,
-                "year": year
+                "year": year,
             })
 
         return albums
@@ -305,10 +357,10 @@ class BrowsingMixin:
               }
             }
         """
-        endpoint = 'browse'
+        endpoint = "browse"
         body = {"browseId": channelId}
         response = self._send_request(endpoint, body)
-        user = {'name': nav(response, ['header', 'musicVisualHeaderRenderer'] + TITLE_TEXT)}
+        user = {"name": nav(response, ["header", "musicVisualHeaderRenderer"] + TITLE_TEXT)}
         results = nav(response, SINGLE_COLUMN_TAB + SECTION_LIST)
         user.update(self.parser.parse_artist_contents(results))
         return user
@@ -338,13 +390,13 @@ class BrowsingMixin:
                 }
             ]
         """
-        endpoint = 'browse'
-        body = {"browseId": channelId, 'params': params}
+        endpoint = "browse"
+        body = {"browseId": channelId, "params": params}
         response = self._send_request(endpoint, body)
         data = nav(response, SINGLE_COLUMN_TAB + SECTION_LIST + MUSIC_SHELF)
         user_playlists = []
-        for result in data['contents']:
-            data = result['musicResponsiveListItemRenderer']
+        for result in data["contents"]:
+            data = result["musicResponsiveListItemRenderer"]
             user_playlists.append({
                 "browseId": nav(data, NAVIGATION_BROWSE_ID),
                 "title": get_item_text(data, 0),
@@ -393,52 +445,52 @@ class BrowsingMixin:
             }
         """
         body = prepare_browse_endpoint("ALBUM", browseId)
-        endpoint = 'browse'
+        endpoint = "browse"
         response = self._send_request(endpoint, body)
         data = nav(response, FRAMEWORK_MUTATIONS)
         album = {}
-        album_data = find_object_by_key(data, 'musicAlbumRelease', 'payload', True)
-        album['title'] = album_data['title']
-        album['trackCount'] = album_data['trackCount']
-        album['durationMs'] = album_data['durationMs']
-        album['playlistId'] = album_data['audioPlaylistId']
-        album['releaseDate'] = album_data['releaseDate']
-        album['description'] = find_object_by_key(data, 'musicAlbumReleaseDetail', 'payload',
-                                                  True)['description']
-        album['thumbnails'] = album_data['thumbnailDetails']['thumbnails']
-        album['artist'] = []
-        artists_data = find_objects_by_key(data, 'musicArtist', 'payload')
+        album_data = find_object_by_key(data, "musicAlbumRelease", "payload", True)
+        album["title"] = album_data["title"]
+        album["trackCount"] = album_data["trackCount"]
+        album["durationMs"] = album_data["durationMs"]
+        album["playlistId"] = album_data["audioPlaylistId"]
+        album["releaseDate"] = album_data["releaseDate"]
+        album["description"] = find_object_by_key(data, "musicAlbumReleaseDetail", "payload",
+                                                  True)["description"]
+        album["thumbnails"] = album_data["thumbnailDetails"]["thumbnails"]
+        album["artist"] = []
+        artists_data = find_objects_by_key(data, "musicArtist", "payload")
         for artist in artists_data:
-            album['artist'].append({
-                'name': artist['musicArtist']['name'],
-                'id': artist['musicArtist']['externalChannelId']
+            album["artist"].append({
+                "name": artist["musicArtist"]["name"],
+                "id": artist["musicArtist"]["externalChannelId"],
             })
-        album['tracks'] = []
+        album["tracks"] = []
 
         likes = {}
         for item in data:
-            if 'musicTrackUserDetail' in item['payload']:
-                like_state = item['payload']['musicTrackUserDetail']['likeState'].split('_')[-1]
-                parent_track = item['payload']['musicTrackUserDetail']['parentTrack']
-                if like_state in ['NEUTRAL', 'UNKNOWN']:
-                    likes[parent_track] = 'INDIFFERENT'
+            if "musicTrackUserDetail" in item["payload"]:
+                like_state = item["payload"]["musicTrackUserDetail"]["likeState"].split("_")[-1]
+                parent_track = item["payload"]["musicTrackUserDetail"]["parentTrack"]
+                if like_state in ["NEUTRAL", "UNKNOWN"]:
+                    likes[parent_track] = "INDIFFERENT"
                 else:
                     likes[parent_track] = like_state[:-1]
 
         for item in data[3:]:
-            if 'musicTrack' in item['payload']:
+            if "musicTrack" in item["payload"]:
                 track = {}
-                track['index'] = item['payload']['musicTrack']['albumTrackIndex']
-                track['title'] = item['payload']['musicTrack']['title']
-                track['thumbnails'] = item['payload']['musicTrack']['thumbnailDetails'][
-                    'thumbnails']
-                track['artists'] = item['payload']['musicTrack']['artistNames']
+                track["index"] = item["payload"]["musicTrack"]["albumTrackIndex"]
+                track["title"] = item["payload"]["musicTrack"]["title"]
+                track["thumbnails"] = item["payload"]["musicTrack"]["thumbnailDetails"][
+                    "thumbnails"]
+                track["artists"] = item["payload"]["musicTrack"]["artistNames"]
                 # in case the song is unavailable, there is no videoId
-                track['videoId'] = item['payload']['musicTrack']['videoId'] if 'videoId' in item[
-                    'payload']['musicTrack'] else None
-                track['lengthMs'] = item['payload']['musicTrack']['lengthMs']
-                track['likeStatus'] = likes[item['entityKey']]
-                album['tracks'].append(track)
+                track["videoId"] = (item["payload"]["musicTrack"]["videoId"]
+                                    if "videoId" in item["payload"]["musicTrack"] else None)
+                track["lengthMs"] = item["payload"]["musicTrack"]["lengthMs"]
+                track["likeStatus"] = likes[item["entityKey"]]
+                album["tracks"].append(track)
 
         return album
 
@@ -523,24 +575,23 @@ class BrowsingMixin:
         params = {"video_id": videoId, "hl": self.language, "el": "detailpage"}
         response = requests.get(endpoint, params, headers=self.headers, proxies=self.proxies)
         text = parse_qs(response.text)
-        if 'player_response' not in text:
+        if "player_response" not in text:
             return text
-        player_response = json.loads(text['player_response'][0])
-        song_meta = player_response['videoDetails']
-        if song_meta['shortDescription'].endswith("Auto-generated by YouTube."):
+        player_response = json.loads(text["player_response"][0])
+        song_meta = player_response["videoDetails"]
+        if song_meta["shortDescription"].endswith("Auto-generated by YouTube."):
             try:
-                description = song_meta['shortDescription'].split('\n\n')
+                description = song_meta["shortDescription"].split("\n\n")
                 for i, detail in enumerate(description):
-                    description[i] = codecs.escape_decode(detail)[0].decode('utf-8')
-                song_meta['provider'] = description[0].replace('Provided to YouTube by ', '')
-                song_meta['artists'] = [artist for artist in description[1].split(' · ')[1:]]
-                song_meta['copyright'] = description[3]
-                song_meta['release'] = None if len(description) < 5 else description[4].replace(
-                    'Released on: ', '')
-                song_meta['production'] = None if len(description) < 6 else [
-                    pub for pub in description[5].split('\n')
-                ]
+                    description[i] = codecs.escape_decode(detail)[0].decode("utf-8")
+                song_meta["provider"] = description[0].replace("Provided to YouTube by ", "")
+                song_meta["artists"] = [artist for artist in description[1].split(" · ")[1:]]
+                song_meta["copyright"] = description[3]
+                song_meta["release"] = (None if len(description) < 5 else description[4].replace(
+                    "Released on: ", ""))
+                song_meta["production"] = (None if len(description) < 6 else
+                                           [pub for pub in description[5].split("\n")])
             except (KeyError, IndexError):
                 pass
-        song_meta['streamingData'] = player_response['streamingData']
+        song_meta["streamingData"] = player_response["streamingData"]
         return song_meta

@@ -100,12 +100,17 @@ class YTMusic(BrowsingMixin, WatchMixin, LibraryMixin, PlaylistsMixin, UploadsMi
                     "The provided credentials are invalid. Reason given by the server: "
                     + response['error']['status'])
 
-    def _send_request(self, endpoint: str, body: Dict, additionalParams: str = "") -> Dict:
+    def _send_request(self,
+                      endpoint: str,
+                      body: Dict,
+                      additionalParams: str = "",
+                      query: Dict = None) -> Dict:
         body.update(self.context)
         if self.auth:
             self.headers["Authorization"] = get_authorization(self.sapisid + ' '
                                                               + self.headers['x-origin'])
         response = requests.post(base_url + endpoint + params + additionalParams,
+                                 params=query,
                                  json=body,
                                  headers=self.headers,
                                  proxies=self.proxies)
@@ -127,9 +132,9 @@ class YTMusic(BrowsingMixin, WatchMixin, LibraryMixin, PlaylistsMixin, UploadsMi
         :return: configuration headers string
         """
         return setup(filepath, headers_raw)
-    
+
     def __enter__(self):
         return self
-    
-    def __exit__(self, execType = None, execValue = None, trackback = None):
+
+    def __exit__(self, execType=None, execValue=None, trackback=None):
         pass
